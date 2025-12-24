@@ -1,0 +1,30 @@
+hybrid-microservices-project/
+│
+├── k8s-microservice-deployment/
+│   ├── frontend/
+│   │   ├── Dockerfile
+│   │   ├── index.js
+│   │   └── index.html
+│   │
+│   ├── backend/
+│   │   ├── Dockerfile
+│   │   └── app.js
+│   │
+│   ├── k8s/
+│   │   ├── frontend-deployment.yaml
+│   │   ├── frontend-service.yaml
+│   │   ├── backend-deployment.yaml
+│   │   └── backend-service.yaml
+│   │
+│   └── kind-cluster.yaml
+│
+├── serverless-microservices/
+│   ├── lambda/
+│   │   └── handler.py
+│   ├── template.yaml
+│   └── api-gateway-config.md
+│
+├── architecture/
+│   └── architecture-diagram.png
+│
+└── README.md

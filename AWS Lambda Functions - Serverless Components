@@ -1,0 +1,449 @@
+# ========================================
+# LAMBDA FUNCTION - Order Processing
+# File: lambda/order-processor/handler.py
+# ========================================
+
+import json
+import boto3
+import os
+from datetime import datetime
+from decimal import Decimal
+
+# AWS Clients
+dynamodb = boto3.resource('dynamodb')
+sns = boto3.client('sns')
+kinesis = boto3.client('kinesis')
+ses = boto3.client('ses')
+
+# Environment variables
+ORDERS_TABLE = os.environ['ORDERS_TABLE']
+SNS_TOPIC = os.environ['SNS_TOPIC_ARN']
+KINESIS_STREAM = os.environ['KINESIS_STREAM_NAME']
+
+def lambda_handler(event, context):
+    """
+    Process incoming orders from API Gateway or SQS
+    """
+    try:
+        # Parse incoming order
+        if 'body' in event:
+            order_data = json.loads(event['body'])
+        else:
+            order_data = event
+        
+        order_id = order_data.get('order_id')
+        user_id = order_data.get('user_id')
+        items = order_data.get('items', [])
+        total_amount = Decimal(str(order_data.get('total_amount', 0)))
+        
+        # Validate order
+        if not order_id or not user_id or not items:
+            return {
+                'statusCode': 400,
+                'body': json.dumps({'error': 'Invalid order data'})
+            }
+        
+        # Save to DynamoDB
+        table = dynamodb.Table(ORDERS_TABLE)
+        order_item = {
+            'order_id': order_id,
+            'user_id': user_id,
+            'items': items,
+            'total_amount': total_amount,
+            'status': 'PROCESSING',
+            'created_at': datetime.utcnow().isoformat(),
+            'updated_at': datetime.utcnow().isoformat()
+        }
+        
+        table.put_item(Item=order_item)
+        
+        # Send to Kinesis for analytics
+        kinesis.put_record(
+            StreamName=KINESIS_STREAM,
+            Data=json.dumps({
+                'event_type': 'order_created',
+                'order_id': order_id,
+                'user_id': user_id,
+                'total_amount': float(total_amount),
+                'timestamp': datetime.utcnow().isoformat()
+            }),
+            PartitionKey=user_id
+        )
+        
+        # Send SNS notification
+        sns.publish(
+            TopicArn=SNS_TOPIC,
+            Subject=f'New Order #{order_id}',
+            Message=json.dumps({
+                'order_id': order_id,
+                'user_id': user_id,
+                'total_amount': float(total_amount),
+                'status': 'PROCESSING'
+            })
+        )
+        
+        # Trigger email notification (async)
+        invoke_email_lambda(order_id, user_id, items, total_amount)
+        
+        return {
+            'statusCode': 200,
+            'headers': {
+                'Content-Type': 'application/json',
+                'Access-Control-Allow-Origin': '*'
+            },
+            'body': json.dumps({
+                'message': 'Order processed successfully',
+                'order_id': order_id,
+                'status': 'PROCESSING'
+            })
+        }
+        
+    except Exception as e:
+        print(f"Error processing order: {str(e)}")
+        return {
+            'statusCode': 500,
+            'body': json.dumps({'error': 'Internal server error'})
+        }
+
+def invoke_email_lambda(order_id, user_id, items, total_amount):
+    """Invoke email notification Lambda asynchronously"""
+    lambda_client = boto3.client('lambda')
+    
+    lambda_client.invoke(
+        FunctionName=os.environ['EMAIL_LAMBDA_NAME'],
+        InvocationType='Event',  # Async
+        Payload=json.dumps({
+            'order_id': order_id,
+            'user_id': user_id,
+            'items': items,
+            'total_amount': float(total_amount)
+        })
+    )
+
+# ========================================
+# LAMBDA FUNCTION - Email Notifications
+# File: lambda/email-notifier/handler.py
+# ========================================
+
+import json
+import boto3
+import os
+from botocore.exceptions import ClientError
+
+ses = boto3.client('ses')
+dynamodb = boto3.resource('dynamodb')
+
+USERS_TABLE = os.environ.get('USERS_TABLE', 'users')
+SOURCE_EMAIL = os.environ.get('SOURCE_EMAIL', 'noreply@shopcloud.com')
+
+def lambda_handler(event, context):
+    """
+    Send order confirmation emails
+    """
+    try:
+        order_id = event.get('order_id')
+        user_id = event.get('user_id')
+        items = event.get('items', [])
+        total_amount = event.get('total_amount')
+        
+        # Get user email from DynamoDB
+        users_table = dynamodb.Table(USERS_TABLE)
+        user_response = users_table.get_item(Key={'user_id': user_id})
+        
+        if 'Item' not in user_response:
+            print(f"User {user_id} not found")
+            return {'statusCode': 404, 'body': 'User not found'}
+        
+        user_email = user_response['Item'].get('email')
+        user_name = user_response['Item'].get('name', 'Customer')
+        
+        # Build email content
+        items_html = '\n'.join([
+            f"<li>{item['name']} - ${item['price']} x {item['quantity']}</li>"
+            for item in items
+        ])
+        
+        email_body = f"""
+        <html>
+        <body>
+            <h2>Order Confirmation</h2>
+            <p>Hi {user_name},</p>
+            <p>Thank you for your order! Here are the details:</p>
+            <p><strong>Order ID:</strong> {order_id}</p>
+            <h3>Items:</h3>
+            <ul>
+                {items_html}
+            </ul>
+            <p><strong>Total: ${total_amount}</strong></p>
+            <p>We'll send you another email when your order ships.</p>
+            <p>Best regards,<br>ShopCloud Team</p>
+        </body>
+        </html>
+        """
+        
+        # Send email via SES
+        response = ses.send_email(
+            Source=SOURCE_EMAIL,
+            Destination={'ToAddresses': [user_email]},
+            Message={
+                'Subject': {'Data': f'Order Confirmation - #{order_id}'},
+                'Body': {
+                    'Html': {'Data': email_body}
+                }
+            }
+        )
+        
+        print(f"Email sent to {user_email}, MessageId: {response['MessageId']}")
+        
+        return {
+            'statusCode': 200,
+            'body': json.dumps({'message': 'Email sent successfully'})
+        }
+        
+    except ClientError as e:
+        print(f"SES Error: {e.response['Error']['Message']}")
+        return {
+            'statusCode': 500,
+            'body': json.dumps({'error': 'Failed to send email'})
+        }
+    except Exception as e:
+        print(f"Error: {str(e)}")
+        return {
+            'statusCode': 500,
+            'body': json.dumps({'error': str(e)})
+        }
+
+# ========================================
+# LAMBDA FUNCTION - Image Resizer
+# File: lambda/image-resizer/handler.py
+# ========================================
+
+import json
+import boto3
+import os
+from PIL import Image
+import io
+
+s3 = boto3.client('s3')
+
+THUMBNAIL_SIZES = [(150, 150), (300, 300), (800, 800)]
+
+def lambda_handler(event, context):
+    """
+    Resize images uploaded to S3 bucket
+    Triggered by S3 PUT events
+    """
+    try:
+        # Get bucket and key from S3 event
+        for record in event['Records']:
+            bucket = record['s3']['bucket']['name']
+            key = record['s3']['object']['key']
+            
+            # Skip if already a thumbnail
+            if '/thumbnails/' in key:
+                continue
+            
+            print(f"Processing image: {bucket}/{key}")
+            
+            # Download image from S3
+            response = s3.get_object(Bucket=bucket, Key=key)
+            image_data = response['Body'].read()
+            
+            # Open image with PIL
+            image = Image.open(io.BytesIO(image_data))
+            
+            # Generate thumbnails
+            for width, height in THUMBNAIL_SIZES:
+                # Resize image
+                thumbnail = image.copy()
+                thumbnail.thumbnail((width, height), Image.Resampling.LANCZOS)
+                
+                # Save to buffer
+                buffer = io.BytesIO()
+                thumbnail.save(buffer, format=image.format)
+                buffer.seek(0)
+                
+                # Upload to S3
+                thumbnail_key = f"thumbnails/{width}x{height}/{key}"
+                s3.put_object(
+                    Bucket=bucket,
+                    Key=thumbnail_key,
+                    Body=buffer,
+                    ContentType=response['ContentType']
+                )
+                
+                print(f"Created thumbnail: {thumbnail_key}")
+        
+        return {
+            'statusCode': 200,
+            'body': json.dumps({'message': 'Thumbnails created successfully'})
+        }
+        
+    except Exception as e:
+        print(f"Error processing image: {str(e)}")
+        return {
+            'statusCode': 500,
+            'body': json.dumps({'error': str(e)})
+        }
+
+# ========================================
+# LAMBDA FUNCTION - Analytics Stream Processor
+# File: lambda/analytics-processor/handler.py
+# ========================================
+
+import json
+import boto3
+import base64
+from datetime import datetime
+
+s3 = boto3.client('s3')
+dynamodb = boto3.resource('dynamodb')
+
+ANALYTICS_BUCKET = os.environ['ANALYTICS_BUCKET']
+METRICS_TABLE = os.environ['METRICS_TABLE']
+
+def lambda_handler(event, context):
+    """
+    Process records from Kinesis stream
+    Aggregate and store analytics data
+    """
+    processed_records = 0
+    failed_records = 0
+    
+    try:
+        for record in event['Records']:
+            try:
+                # Decode Kinesis data
+                payload = base64.b64decode(record['kinesis']['data'])
+                data = json.loads(payload)
+                
+                event_type = data.get('event_type')
+                timestamp = data.get('timestamp')
+                
+                # Process different event types
+                if event_type == 'order_created':
+                    process_order_event(data)
+                elif event_type == 'product_viewed':
+                    process_product_view(data)
+                elif event_type == 'user_signup':
+                    process_user_signup(data)
+                
+                # Store raw event to S3
+                store_raw_event_to_s3(data)
+                
+                processed_records += 1
+                
+            except Exception as e:
+                print(f"Error processing record: {str(e)}")
+                failed_records += 1
+        
+        return {
+            'statusCode': 200,
+            'body': json.dumps({
+                'processed': processed_records,
+                'failed': failed_records
+            })
+        }
+        
+    except Exception as e:
+        print(f"Lambda error: {str(e)}")
+        return {
+            'statusCode': 500,
+            'body': json.dumps({'error': str(e)})
+        }
+
+def process_order_event(data):
+    """Update order metrics in DynamoDB"""
+    table = dynamodb.Table(METRICS_TABLE)
+    
+    date_key = datetime.utcnow().strftime('%Y-%m-%d')
+    
+    table.update_item(
+        Key={'metric_type': 'daily_orders', 'date': date_key},
+        UpdateExpression='ADD order_count :inc, total_revenue :amount',
+        ExpressionAttributeValues={
+            ':inc': 1,
+            ':amount': data['total_amount']
+        }
+    )
+
+def process_product_view(data):
+    """Track product views"""
+    table = dynamodb.Table(METRICS_TABLE)
+    
+    table.update_item(
+        Key={'metric_type': 'product_views', 'product_id': data['product_id']},
+        UpdateExpression='ADD view_count :inc',
+        ExpressionAttributeValues={':inc': 1}
+    )
+
+def process_user_signup(data):
+    """Track user signups"""
+    table = dynamodb.Table(METRICS_TABLE)
+    
+    date_key = datetime.utcnow().strftime('%Y-%m-%d')
+    
+    table.update_item(
+        Key={'metric_type': 'daily_signups', 'date': date_key},
+        UpdateExpression='ADD signup_count :inc',
+        ExpressionAttributeValues={':inc': 1}
+    )
+
+def store_raw_event_to_s3(data):
+    """Store raw event data in S3 for long-term analytics"""
+    timestamp = datetime.utcnow()
+    year = timestamp.strftime('%Y')
+    month = timestamp.strftime('%m')
+    day = timestamp.strftime('%d')
+    hour = timestamp.strftime('%H')
+    
+    key = f"events/{year}/{month}/{day}/{hour}/{timestamp.timestamp()}.json"
+    
+    s3.put_object(
+        Bucket=ANALYTICS_BUCKET,
+        Key=key,
+        Body=json.dumps(data),
+        ContentType='application/json'
+    )
+
+# ========================================
+# SERVERLESS FRAMEWORK CONFIG
+# File: lambda/serverless.yml
+# ========================================
+
+# service: shopcloud-lambda-functions
+# 
+# provider:
+#   name: aws
+#   runtime: python3.11
+#   region: us-east-1
+#   stage: ${opt:stage, 'dev'}
+#   environment:
+#     STAGE: ${self:provider.stage}
+#   
+# functions:
+#   orderProcessor:
+#     handler: order-processor/handler.lambda_handler
+#     events:
+#       - http:
+#           path: orders/process
+#           method: post
+#       - sqs:
+#           arn: !GetAtt OrderQueue.Arn
+#   
+#   emailNotifier:
+#     handler: email-notifier/handler.lambda_handler
+#   
+#   imageResizer:
+#     handler: image-resizer/handler.lambda_handler
+#     events:
+#       - s3:
+#           bucket: shopcloud-images
+#           event: s3:ObjectCreated:*
+#   
+#   analyticsProcessor:
+#     handler: analytics-processor/handler.lambda_handler
+#     events:
+#       - stream:
+#           type: kinesis
+#           arn: !GetAtt AnalyticsStream.Arn

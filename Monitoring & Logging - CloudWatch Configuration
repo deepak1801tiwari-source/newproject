@@ -1,0 +1,412 @@
+# ========================================
+# CLOUDWATCH DASHBOARD CONFIGURATION
+# File: monitoring/cloudwatch-dashboard.json
+# ========================================
+
+{
+  "widgets": [
+    {
+      "type": "metric",
+      "properties": {
+        "metrics": [
+          ["AWS/ECS", "CPUUtilization", { "stat": "Average" }],
+          [".", "MemoryUtilization", { "stat": "Average" }]
+        ],
+        "view": "timeSeries",
+        "stacked": false,
+        "region": "us-east-1",
+        "title": "EKS Cluster Resource Usage",
+        "period": 300,
+        "yAxis": {
+          "left": {
+            "min": 0,
+            "max": 100
+          }
+        }
+      }
+    },
+    {
+      "type": "metric",
+      "properties": {
+        "metrics": [
+          ["AWS/ApplicationELB", "RequestCount", { "stat": "Sum" }],
+          [".", "TargetResponseTime", { "stat": "Average" }],
+          [".", "HTTPCode_Target_5XX_Count", { "stat": "Sum" }],
+          [".", "HTTPCode_Target_4XX_Count", { "stat": "Sum" }]
+        ],
+        "view": "timeSeries",
+        "region": "us-east-1",
+        "title": "API Gateway Metrics",
+        "period": 60
+      }
+    },
+    {
+      "type": "metric",
+      "properties": {
+        "metrics": [
+          ["AWS/RDS", "DatabaseConnections", { "stat": "Average" }],
+          [".", "CPUUtilization", { "stat": "Average" }],
+          [".", "FreeableMemory", { "stat": "Average" }]
+        ],
+        "view": "timeSeries",
+        "region": "us-east-1",
+        "title": "RDS PostgreSQL Metrics",
+        "period": 300
+      }
+    },
+    {
+      "type": "log",
+      "properties": {
+        "query": "SOURCE '/aws/lambda/order-processor'\n| fields @timestamp, @message\n| filter @message like /ERROR/\n| sort @timestamp desc\n| limit 20",
+        "region": "us-east-1",
+        "title": "Lambda Errors"
+      }
+    }
+  ]
+}
+
+# ========================================
+# CLOUDWATCH ALARMS - Terraform
+# File: monitoring/alarms.tf
+# ========================================
+
+resource "aws_cloudwatch_metric_alarm" "high_cpu" {
+  alarm_name          = "${var.environment}-high-cpu-utilization"
+  comparison_operator = "GreaterThanThreshold"
+  evaluation_periods  = "2"
+  metric_name         = "CPUUtilization"
+  namespace           = "AWS/EKS"
+  period              = "300"
+  statistic           = "Average"
+  threshold           = "80"
+  alarm_description   = "This metric monitors EKS CPU utilization"
+  alarm_actions       = [aws_sns_topic.alerts.arn]
+  
+  dimensions = {
+    ClusterName = aws_eks_cluster.main.name
+  }
+}
+
+resource "aws_cloudwatch_metric_alarm" "high_memory" {
+  alarm_name          = "${var.environment}-high-memory-utilization"
+  comparison_operator = "GreaterThanThreshold"
+  evaluation_periods  = "2"
+  metric_name         = "MemoryUtilization"
+  namespace           = "AWS/EKS"
+  period              = "300"
+  statistic           = "Average"
+  threshold           = "85"
+  alarm_description   = "This metric monitors EKS memory utilization"
+  alarm_actions       = [aws_sns_topic.alerts.arn]
+}
+
+resource "aws_cloudwatch_metric_alarm" "api_5xx_errors" {
+  alarm_name          = "${var.environment}-api-5xx-errors"
+  comparison_operator = "GreaterThanThreshold"
+  evaluation_periods  = "1"
+  metric_name         = "5XXError"
+  namespace           = "AWS/ApiGateway"
+  period              = "60"
+  statistic           = "Sum"
+  threshold           = "10"
+  alarm_description   = "Alert on API Gateway 5XX errors"
+  alarm_actions       = [aws_sns_topic.alerts.arn]
+  treat_missing_data  = "notBreaching"
+}
+
+resource "aws_cloudwatch_metric_alarm" "rds_cpu" {
+  alarm_name          = "${var.environment}-rds-high-cpu"
+  comparison_operator = "GreaterThanThreshold"
+  evaluation_periods  = "2"
+  metric_name         = "CPUUtilization"
+  namespace           = "AWS/RDS"
+  period              = "300"
+  statistic           = "Average"
+  threshold           = "75"
+  alarm_description   = "RDS CPU utilization is too high"
+  alarm_actions       = [aws_sns_topic.alerts.arn]
+  
+  dimensions = {
+    DBInstanceIdentifier = aws_db_instance.postgres.id
+  }
+}
+
+resource "aws_cloudwatch_metric_alarm" "lambda_errors" {
+  alarm_name          = "${var.environment}-lambda-errors"
+  comparison_operator = "GreaterThanThreshold"
+  evaluation_periods  = "1"
+  metric_name         = "Errors"
+  namespace           = "AWS/Lambda"
+  period              = "60"
+  statistic           = "Sum"
+  threshold           = "5"
+  alarm_description   = "Lambda function errors exceed threshold"
+  alarm_actions       = [aws_sns_topic.alerts.arn]
+}
+
+resource "aws_cloudwatch_metric_alarm" "billing_alarm" {
+  alarm_name          = "${var.environment}-billing-alert"
+  comparison_operator = "GreaterThanThreshold"
+  evaluation_periods  = "1"
+  metric_name         = "EstimatedCharges"
+  namespace           = "AWS/Billing"
+  period              = "21600"  # 6 hours
+  statistic           = "Maximum"
+  threshold           = "50"
+  alarm_description   = "Alert when estimated charges exceed $50"
+  alarm_actions       = [aws_sns_topic.billing_alerts.arn]
+  
+  dimensions = {
+    Currency = "USD"
+  }
+}
+
+# ========================================
+# SNS TOPICS FOR ALERTS
+# ========================================
+
+resource "aws_sns_topic" "alerts" {
+  name = "${var.environment}-cloudops-alerts"
+  
+  tags = {
+    Environment = var.environment
+  }
+}
+
+resource "aws_sns_topic_subscription" "alerts_email" {
+  topic_arn = aws_sns_topic.alerts.arn
+  protocol  = "email"
+  endpoint  = var.alert_email
+}
+
+resource "aws_sns_topic" "billing_alerts" {
+  name = "${var.environment}-billing-alerts"
+}
+
+resource "aws_sns_topic_subscription" "billing_email" {
+  topic_arn = aws_sns_topic.billing_alerts.arn
+  protocol  = "email"
+  endpoint  = var.alert_email
+}
+
+# ========================================
+# PROMETHEUS & GRAFANA SETUP
+# File: monitoring/prometheus-config.yaml
+# ========================================
+
+global:
+  scrape_interval: 15s
+  evaluation_interval: 15s
+  external_labels:
+    cluster: 'shopcloud-eks'
+    environment: 'production'
+
+# Alertmanager configuration
+alerting:
+  alertmanagers:
+    - static_configs:
+        - targets:
+            - alertmanager:9093
+
+# Load rules once and periodically evaluate them
+rule_files:
+  - /etc/prometheus/rules/*.yml
+
+# Scrape configurations
+scrape_configs:
+  # Kubernetes API server
+  - job_name: 'kubernetes-apiservers'
+    kubernetes_sd_configs:
+      - role: endpoints
+    scheme: https
+    tls_config:
+      ca_file: /var/run/secrets/kubernetes.io/serviceaccount/ca.crt
+    bearer_token_file: /var/run/secrets/kubernetes.io/serviceaccount/token
+    relabel_configs:
+      - source_labels: [__meta_kubernetes_namespace, __meta_kubernetes_service_name, __meta_kubernetes_endpoint_port_name]
+        action: keep
+        regex: default;kubernetes;https
+
+  # Kubernetes nodes
+  - job_name: 'kubernetes-nodes'
+    kubernetes_sd_configs:
+      - role: node
+    scheme: https
+    tls_config:
+      ca_file: /var/run/secrets/kubernetes.io/serviceaccount/ca.crt
+    bearer_token_file: /var/run/secrets/kubernetes.io/serviceaccount/token
+
+  # Kubernetes pods
+  - job_name: 'kubernetes-pods'
+    kubernetes_sd_configs:
+      - role: pod
+    relabel_configs:
+      - source_labels: [__meta_kubernetes_pod_annotation_prometheus_io_scrape]
+        action: keep
+        regex: true
+      - source_labels: [__meta_kubernetes_pod_annotation_prometheus_io_path]
+        action: replace
+        target_label: __metrics_path__
+        regex: (.+)
+      - source_labels: [__address__, __meta_kubernetes_pod_annotation_prometheus_io_port]
+        action: replace
+        regex: ([^:]+)(?::\d+)?;(\d+)
+        replacement: $1:$2
+        target_label: __address__
+
+  # Microservices
+  - job_name: 'user-service'
+    static_configs:
+      - targets: ['user-service:3001']
+  
+  - job_name: 'product-service'
+    static_configs:
+      - targets: ['product-service:3002']
+  
+  - job_name: 'cart-service'
+    static_configs:
+      - targets: ['cart-service:3003']
+  
+  - job_name: 'order-service'
+    static_configs:
+      - targets: ['order-service:3004']
+
+# ========================================
+# ALERT RULES
+# File: monitoring/prometheus-rules.yml
+# ========================================
+
+groups:
+  - name: application
+    interval: 30s
+    rules:
+      - alert: HighErrorRate
+        expr: |
+          sum(rate(http_requests_total{status=~"5.."}[5m])) by (service)
+          /
+          sum(rate(http_requests_total[5m])) by (service)
+          > 0.05
+        for: 5m
+        labels:
+          severity: critical
+        annotations:
+          summary: "High error rate on {{ $labels.service }}"
+          description: "Error rate is {{ $value | humanizePercentage }}"
+      
+      - alert: HighResponseTime
+        expr: |
+          histogram_quantile(0.99, 
+            sum(rate(http_request_duration_seconds_bucket[5m])) by (le, service)
+          ) > 1
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "High response time on {{ $labels.service }}"
+          description: "99th percentile response time is {{ $value }}s"
+      
+      - alert: PodCrashLooping
+        expr: rate(kube_pod_container_status_restarts_total[15m]) > 0
+        for: 5m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Pod {{ $labels.pod }} is crash looping"
+          description: "Pod has restarted {{ $value }} times in the last 15 minutes"
+      
+      - alert: HighMemoryUsage
+        expr: |
+          (sum(container_memory_working_set_bytes) by (pod)
+          /
+          sum(container_spec_memory_limit_bytes) by (pod)) > 0.9
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "High memory usage on {{ $labels.pod }}"
+          description: "Memory usage is at {{ $value | humanizePercentage }}"
+
+# ========================================
+# GRAFANA DASHBOARD JSON
+# File: monitoring/grafana-dashboard.json
+# ========================================
+
+{
+  "dashboard": {
+    "title": "CloudOps Platform Overview",
+    "panels": [
+      {
+        "title": "Request Rate",
+        "targets": [
+          {
+            "expr": "sum(rate(http_requests_total[5m])) by (service)"
+          }
+        ],
+        "type": "graph"
+      },
+      {
+        "title": "Error Rate",
+        "targets": [
+          {
+            "expr": "sum(rate(http_requests_total{status=~\"5..\"}[5m])) by (service)"
+          }
+        ],
+        "type": "graph"
+      },
+      {
+        "title": "Response Time (p99)",
+        "targets": [
+          {
+            "expr": "histogram_quantile(0.99, sum(rate(http_request_duration_seconds_bucket[5m])) by (le, service))"
+          }
+        ],
+        "type": "graph"
+      },
+      {
+        "title": "Active Pods",
+        "targets": [
+          {
+            "expr": "count(kube_pod_info) by (namespace)"
+          }
+        ],
+        "type": "stat"
+      }
+    ]
+  }
+}
+
+# ========================================
+# LOGGING WITH FLUENTD
+# File: monitoring/fluentd-config.yaml
+# ========================================
+
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: fluentd-config
+  namespace: kube-system
+data:
+  fluent.conf: |
+    <source>
+      @type tail
+      path /var/log/containers/*.log
+      pos_file /var/log/fluentd-containers.log.pos
+      tag kubernetes.*
+      read_from_head true
+      <parse>
+        @type json
+        time_format %Y-%m-%dT%H:%M:%S.%NZ
+      </parse>
+    </source>
+
+    <filter kubernetes.**>
+      @type kubernetes_metadata
+    </filter>
+
+    <match kubernetes.**>
+      @type cloudwatch_logs
+      log_group_name /aws/eks/shopcloud
+      log_stream_name ${tag}
+      auto_create_stream true
+      region us-east-1
+    </match>

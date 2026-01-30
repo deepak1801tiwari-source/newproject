@@ -3,25 +3,31 @@ For Ubuntu/Linux:
 bash# Update your system
 sudo apt update && sudo apt upgrade -y
 
+
 # Install Git (for code versioning)
 sudo apt install git -y
+
 
 # Install Node.js (for running JavaScript)
 curl -fsSL https://deb.nodesource.com/setup_18.x | sudo -E bash -
 sudo apt install nodejs -y
 
+
 # Install Python
 sudo apt install python3 python3-pip -y
+
 
 # Install Docker (for containers)
 sudo apt install docker.io -y
 sudo systemctl start docker
 sudo usermod -aG docker $USER
 
+
 # Install AWS CLI (to control AWS)
 curl "https://awscli.amazonaws.com/awscli-exe-linux-x86_64.zip" -o "awscliv2.zip"
 unzip awscliv2.zip
 sudo ./aws/install
+
 
 # Install Terraform (for infrastructure)
 wget https://releases.hashicorp.com/terraform/1.6.0/terraform_1.6.0_linux_amd64.zip
